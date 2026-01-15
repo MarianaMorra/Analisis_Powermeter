@@ -1,0 +1,3 @@
+maquina,tipo_alarma,descripcion,fase,valor_medido,valor_limite,fecha_primera_deteccion,duracion_min
+PLE1,SOBRECORRIENTE,Sobrecorriente sostenida por encima del límite,T,17.730255657261413,17,2026-01-09 18:28:43-03:00,10.1
+PLE1,SOBRECORRIENTE,Sobrecorriente sostenida por encima del límite,T,17.885173413963415,17,2026-01-09 18:45:16-03:00,6.85
