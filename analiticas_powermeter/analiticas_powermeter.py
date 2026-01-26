@@ -9,6 +9,7 @@ from sklearn.cluster import KMeans
 #import time
 import pytz
 from datetime import datetime
+import csv
 
 # Cargar las variables de entorno
 DB_HOST = os.environ.get("DB_HOST", "")
@@ -27,8 +28,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Parametros y constantes
-umbral_pico = 0.4
-ventana_pico = 2
+umbral_pico = 0.5
+ventana_pico = 5
 fases = {
     "r": {
         "i": "corriente_r",
@@ -53,42 +54,55 @@ fases = {
 claves_features = ['media', 'std', 'pendiente', 'energia']
 
 # Conexión a la base de datos.
-
 # Obtiene las placas con la analítica de powermeter habilitada
-
 # Obtener configuracon de la analitica del powermeter
-
 # Obtener cual fue la ultima fecha analizada 
-
 # Importar datos desde .csv (BORRAR UNA VEZ QUE ESTE ESTABLECIDA LA CONEXION CON LA BASE DE DATOS)
 #==================================================================================================================================
-import csv
-from datetime import datetime
+import pandas as pd
 
-def cargar_data_desde_csv(path_csv, numero_serie=None):
-    data = []
+def cargar_data_desde_csv(path_csv, max_filas=None):
+    df = pd.read_csv(path_csv)
 
-    with open(path_csv, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            if numero_serie and row["numero_serie"] != numero_serie:
-                continue
+    # parsear timestamp sin asumir formato
+    df['temporal_placa'] = pd.to_datetime(
+        df['temporal_placa'],
+        errors='coerce',
+        dayfirst=True
+    )
 
-            data.append({
-                "timestamp": datetime.fromisoformat(row["temporal_placa"]),
-                "corriente_r": float(row["corriente_r"]),
-                "corriente_s": float(row["corriente_s"]),
-                "corriente_t": float(row["corriente_t"]),
-                "potencia_a_r": float(row["potencia_a_r"]),
-                "potencia_a_s": float(row["potencia_a_s"]),
-                "potencia_a_t": float(row["potencia_a_t"]),
-            })
+    # descartar filas inválidas
+    df = df[df['temporal_placa'].notna()]
 
-    data.sort(key=lambda x: x["timestamp"])
+    if max_filas:
+        df = df.iloc[:max_filas]
+
+    # quedarnos solo con las columnas que importan
+    cols = [
+        'temporal_placa',
+        'corriente_r', 'corriente_s', 'corriente_t',
+        'potencia_a_r', 'potencia_a_s', 'potencia_a_t'
+    ]
+    df = df[cols]
+
+    # convertir TODO a lista de dicts (rápido)
+    data = [
+        {
+            "timestamp": r['temporal_placa'],
+            "corriente_r": r['corriente_r'],
+            "corriente_s": r['corriente_s'],
+            "corriente_t": r['corriente_t'],
+            "potencia_a_r": r['potencia_a_r'],
+            "potencia_a_s": r['potencia_a_s'],
+            "potencia_a_t": r['potencia_a_t'],
+        }
+        for r in df.to_dict(orient="records")
+    ]
+
     return data
 
 #==================================================================================================================================
-from datetime import datetime
+
 def normalizar_timestamp(ts):
 
     if ts is None:
@@ -102,41 +116,33 @@ def normalizar_timestamp(ts):
 
     return ts
 
-def ordenar_por_tiempo(data, key="timestamp"):
-    return sorted(data, key=lambda x: x[key])
-
-
+# Genera las ventanas de muestras para el clustering
 from datetime import timedelta
 
-# Genera las ventanas de muestras para el clustering
-def generar_ventanas(data, duracion_s, paso_s=None, key_ts="timestamp"):
-
+def generar_ventanas(data, duracion_s, paso_s=None):
     if not data:
         return []
 
     if paso_s is None:
         paso_s = duracion_s
 
-    ventanas = []
     dur = timedelta(seconds=duracion_s)
     paso = timedelta(seconds=paso_s)
 
-    inicio = data[0][key_ts]
-    fin_total = data[-1][key_ts]
+    ventanas = []
+    inicio = data[0]["timestamp"]
+    fin_total = data[-1]["timestamp"]
 
-    j0 = 0
+    i = 0
+    n = len(data)
 
     while inicio <= fin_total:
         fin = inicio + dur
-
-        while j0 < len(data) and data[j0][key_ts] < inicio:
-            j0 += 1
-
-        j = j0
         ventana = []
-        while j < len(data) and data[j][key_ts] < fin:
-            ventana.append(data[j])
-            j += 1
+
+        while i < n and data[i]["timestamp"] < fin:
+            ventana.append(data[i])
+            i += 1
 
         if ventana:
             ventanas.append(ventana)
@@ -147,23 +153,36 @@ def generar_ventanas(data, duracion_s, paso_s=None, key_ts="timestamp"):
 
 # Extrae features de interes por ventana: energia/media/varianza/desvio/pendiente    
 def extraer_features_por_fase(ventana):
-    features = []
-
     if len(ventana) < 2:
-        return features
+        return []
 
+    features = []
     timestamps = [m["timestamp"] for m in ventana]
 
-    dt = [0.0]
-    for i in range(1, len(timestamps)):
-        dt.append((timestamps[i] - timestamps[i-1]).total_seconds())
-
     for fase, cols in fases.items():
-        segI = [m[cols["i"]] for m in ventana]
-        segP = [m[cols["p"]] for m in ventana]
+        segI = [
+            m[cols["i"]] for m in ventana
+            if isinstance(m[cols["i"]], (int, float))
+        ]
+        segP = [
+            m[cols["p"]] for m in ventana
+            if isinstance(m[cols["p"]], (int, float))
+        ]
 
-        energia = sum(p * d for p, d in zip(segP, dt))
+        if len(segI) < 2 or len(segP) < 2:
+            continue
 
+        # tiempos
+        dt = []
+        for i in range(1, len(timestamps)):
+            d = (timestamps[i] - timestamps[i-1]).total_seconds()
+            if d > 0:
+                dt.append(d)
+
+        if not dt:
+            continue
+
+        energia = sum(p * d for p, d in zip(segP[1:], dt))
         media = sum(segI) / len(segI)
         var = sum((x - media) ** 2 for x in segI) / len(segI)
         std = var ** 0.5
@@ -179,80 +198,55 @@ def extraer_features_por_fase(ventana):
 
     return features
 
-# Normaliza los features para que ninguno sesgue el clustering
-def normalizar_features_por_fase(rows, claves_features):
 
-    # agrupar por fase
+# Normaliza los features para que ninguno sesgue el clustering
+def normalizar_features_por_fase(rows, claves):
     por_fase = {}
     for r in rows:
         por_fase.setdefault(r["fase"], []).append(r)
 
     rows_norm = []
-
     for fase, items in por_fase.items():
-        # calcular stats por clave
         stats = {}
-        for k in claves_features:
+        for k in claves:
             vals = [r[k] for r in items]
             mu = sum(vals) / len(vals)
-            var = sum((v - mu) ** 2 for v in vals) / len(vals)
-            sigma = var ** 0.5
-            if sigma == 0:
-                sigma = 1.0
+            sigma = (sum((v - mu) ** 2 for v in vals) / len(vals)) ** 0.5 or 1.0
             stats[k] = (mu, sigma)
 
-        # normalizar
         for r in items:
-            r_norm = r.copy()
-            for k in claves_features:
+            r2 = r.copy()
+            for k in claves:
                 mu, sigma = stats[k]
-                r_norm[k] = (r[k] - mu) / sigma
-            rows_norm.append(r_norm)
+                r2[k] = (r[k] - mu) / sigma
+            rows_norm.append(r2)
 
     return rows_norm
 
 # Genera el clustering de los datos. Utiliza los features normalizados
-def clusterizar_por_fase(rows_norm, claves_features, seed=42):
-     
-    n_clusters = 4
-
-    # agrupar por fase
+def clusterizar_por_fase(rows_norm, claves, n_clusters=4):
     por_fase = {}
     for r in rows_norm:
         por_fase.setdefault(r["fase"], []).append(r)
 
-    rows_clusterizadas = []
-
+    out = []
     for fase, items in por_fase.items():
         if len(items) < n_clusters:
-            # no hay datos suficientes
             for r in items:
-                r_out = r.copy()
-                r_out["cluster"] = None
-                rows_clusterizadas.append(r_out)
+                r2 = r.copy()
+                r2["cluster"] = None
+                out.append(r2)
             continue
 
-        # matriz de features
-        X = [
-            [r[k] for k in claves_features]
-            for r in items
-        ]
+        X = [[r[k] for k in claves] for r in items]
+        labels = KMeans(n_clusters=n_clusters, random_state=42, n_init=10).fit_predict(X)
 
-        kmeans = KMeans(
-            n_clusters= n_clusters,
-            random_state=seed,
-            n_init=10
-        )
-
-        labels = kmeans.fit_predict(X)
-
-        # asignar labels
         for r, lbl in zip(items, labels):
-            r_out = r.copy()
-            r_out["cluster"] = int(lbl)
-            rows_clusterizadas.append(r_out)
+            r2 = r.copy()
+            r2["cluster"] = int(lbl)
+            out.append(r2)
 
-    return rows_clusterizadas
+    return out
 
 # Resumen por fase y cluster (PARA MODIFICAR NOMBRAMIENTO DE ESTADOS SI LAS CONDICIONES DE LAS MAQUINAS VARIAN)
 def resumen_clusters_por_fase(rows_clusterizadas, claves_features):
@@ -281,53 +275,27 @@ def resumen_clusters_por_fase(rows_clusterizadas, claves_features):
     return resumen
 
 # Determina a que estado corresponde cada cluster
-def etiquetar_clusters(
-    stats_clusters,
-    peso_media=0.5,
-    peso_energia=0.5,
-    umbral_apagado_rel=0.1
-):
+def etiquetar_clusters(stats, umbral_apagado_rel=0.1):
+    medias = {c: v["media"] for c, v in stats.items()}
+    energias = {c: v["energia"] for c, v in stats.items()}
 
-    # Extraer valores 
-    medias = {cid: v["media"] for cid, v in stats_clusters.items()}
-    energias = {cid: v["energia"] for cid, v in stats_clusters.items()}
+    def norm(d):
+        mn, mx = min(d.values()), max(d.values())
+        return {k: 0.0 if mx == mn else (v - mn) / (mx - mn) for k, v in d.items()}
 
-    # Normalización min-max por fase
-    def minmax_norm(d):
-        vmin = min(d.values())
-        vmax = max(d.values())
-        if vmax == vmin:
-            return {k: 0.0 for k in d}
-        return {k: (v - vmin) / (vmax - vmin) for k, v in d.items()}
+    m_n = norm(medias)
+    e_n = norm(energias)
 
-    medias_n = minmax_norm(medias)
-    energias_n = minmax_norm(energias)
-
-    # Score combinado 
-    score = {
-        cid: peso_media * medias_n[cid] + peso_energia * energias_n[cid]
-        for cid in stats_clusters
-    }
-
-    # Ordenar por score 
-    ordenados = sorted(score.items(), key=lambda x: x[1])
+    score = {c: 0.5 * m_n[c] + 0.5 * e_n[c] for c in stats}
+    orden = sorted(score.items(), key=lambda x: x[1])
 
     etiquetas = {}
+    cmin, smin = orden[0]
+    etiquetas[cmin] = "apagado" if smin <= umbral_apagado_rel else "reposo_operativo"
+    etiquetas[orden[-1][0]] = "trabajo_efectivo"
 
-    # Cluster menos activo → apagado
-    cid_min, score_min = ordenados[0]
-    if score_min <= umbral_apagado_rel:
-        etiquetas[cid_min] = "apagado"
-    else:
-        etiquetas[cid_min] = "reposo_operativo"
-
-    # Cluster más activo → trabajo
-    cid_max, _ = ordenados[-1]
-    etiquetas[cid_max] = "trabajo_efectivo"
-
-    # Intermedios → reposo
-    for cid, _ in ordenados[1:-1]:
-        etiquetas[cid] = "reposo_operativo"
+    for c, _ in orden[1:-1]:
+        etiquetas[c] = "reposo_operativo"
 
     return etiquetas
 
@@ -367,7 +335,7 @@ def estado_global_maquina(estado_R, estado_S, estado_T):
         return "reposo_operativo"
 
     # Trabajo efectivo: al menos 2 fases trabajando
-    if estados.count("trabajo_efectivo") >= 2:
+    if estados.count("trabajo_efectivo") >= 1:
         return "trabajo_efectivo"
 
     # Cualquier transitorio raro
@@ -588,17 +556,40 @@ def ajustar_inicio_eventos(eventos, picos, ventana_pico_inicio):
 
     return eventos_ajustados
 
+def exportar_eventos_a_csv(eventos, path_csv):
+    if not eventos:
+        print("No hay eventos para exportar")
+        return
+
+    # Tomamos las claves del primer evento
+    fieldnames = eventos[0].keys()
+
+    with open(path_csv, mode="w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for ev in eventos:
+            # Convertir datetime a string ISO
+            ev_out = {}
+            for k, v in ev.items():
+                if hasattr(v, "isoformat"):
+                    ev_out[k] = v.isoformat()
+                else:
+                    ev_out[k] = v
+            writer.writerow(ev_out)
+
+    print(f"Eventos exportados a {path_csv}")
 #================================================================================================================================
 # Ejecuta el cálculo de analíticas para un dispositivo específico.
 def calcular_analiticas(data, n_estable, pausa_min, ventana_anti_apagado, ventana_pico_inicio):
 
-    win = 5
+    win = 10
     eventos_ajustados = []
 
     try:
         # 1) Ventanas
         ventanas = generar_ventanas(data, win)
-        ventanas = ventanas[:200]  # LIMITADOR para performance
+        ventanas = ventanas[:1000]  # LIMITADOR para performance
 
         # 2) Features crudos
         rows = []
@@ -655,6 +646,16 @@ def calcular_analiticas(data, n_estable, pausa_min, ventana_anti_apagado, ventan
                 )
             })
 
+        for r in estados_finales[:200]:  # mirá las primeras 20
+            print(
+                r["t_inicio"],
+                r["estado_R"],
+                r["estado_S"],
+                r["estado_T"],
+                "=>",
+                r["estado_global"]
+            )
+
         # 9) Rango válido
         idx_inicio, idx_fin = determinar_rango_valido(estados_finales, n_estable)
 
@@ -687,12 +688,10 @@ if __name__ == "__main__":
 
     ZONA_HORARIA = pytz.timezone("UTC")
 
-    CSV_PATH = r"C:\Users\HP Spectre X360\Desktop\MARIANA\COLLOQUIA_2025\Analisis_Powermeter\data\PLE1\12-1-2026\12-1-2026_PLE1.csv"
+    CSV_PATH = r"C:\Users\HP Spectre X360\Desktop\MARIANA\COLLOQUIA_2025\Analisis_Powermeter\Pruebas\12-1-2026_prueba\12-1-2026_PLE1.csv"
 
-    win = 10
-    n_clusters = 4
     pausa_min = 3
-    ventana_anti_apagado = 60
+    ventana_anti_apagado = 13
     ventana_pico_inicio = 5
     n_estable = 5
 
@@ -706,11 +705,6 @@ if __name__ == "__main__":
         if not data:
             raise RuntimeError("No se cargaron datos")
 
-        # 2) Normalizar timestamps (si ya lo hacés en loader, esto puede ser no-op)
-    
-        print("Normalizando timestamps...")
-        data = ordenar_por_tiempo(data, key="timestamp")
-
         # 3) Ejecutar analítica principal
         print("Ejecutando analíticas...")
         eventos = calcular_analiticas( data, n_estable, pausa_min, ventana_anti_apagado, ventana_pico_inicio)
@@ -720,7 +714,7 @@ if __name__ == "__main__":
         print(f"Eventos detectados: {len(eventos)}")
 
         if eventos:
-            print("Primer evento:", eventos[0])
+            exportar_eventos_a_csv(eventos, r"C:\Users\HP Spectre X360\Desktop\MARIANA\COLLOQUIA_2025\Analisis_Powermeter\eventos_powermeter.csv")
 
         print("== Fin de ejecución ==")
 

@@ -54,9 +54,6 @@ def cargar_data_desde_csv(path_csv, limit=None):
                 "potencia_a_t": float(row["potencia_a_t"]),
             })
 
-            if i % 50000 == 0 and i > 0:
-                print(f"{i} filas cargadas...")
-
     return data
 # =========================================================
 # VENTANAS TEMPORALES
@@ -318,7 +315,7 @@ def exportar_eventos_a_csv(eventos, path_csv):
 # =========================================================
 if __name__ == "__main__":
 
-    CSV_PATH = r"C:\Users\HP Spectre X360\Desktop\MARIANA\COLLOQUIA_2025\Analisis_Powermeter\data\PLE1\12-1-2026\12-1-2026_PLE1.csv"
+    CSV_PATH = r"C:\Users\HP Spectre X360\Desktop\MARIANA\COLLOQUIA_2025\Analisis_Powermeter\data\PLE1\12-1-2026_prueba"
 
     print("== Iniciando analítica powermeter ==")
     data = cargar_data_desde_csv(CSV_PATH, limit=100000)
