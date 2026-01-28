@@ -57,13 +57,13 @@ def obtener_placas_habilitadas(conn, id_analitica):
 # Obtener configuracon de la analitica de bobinas
 def obtener_configuracion_analitica(conn):
     return (
-        3,      # tiempo_ejecucion
-        60,     # win_s
-        3,      # ventana_media_s
-        3,      # tolerancia_rel
-        2,      # umbral_delta
-        120,    # tiempo_estable_s
-        3600    # duracion_max_evento
+        300,    # tiempo_ejecucion:  minutos
+        60,     # win_s [s] -> intervalo de datos crudos que se toman para analizar
+        3,      # ventana_media_s    -> cantidad de muestras que se toman para establecer una media
+        3,      # tolerancia_rel [%] -> tolerancia esatblecida para definir un valor sobre la media de corriente
+        2,      # umbral_delta [A]  -> minima variacion de corriente para ser considerado un pico
+        120,    # tiempo_estable_s[s]   -> tiempo minimo durante el cual la corriente se encuentra sobre la media para declarar evento cerrado
+        3600    # duracion_max_evento: 1 hora
     )    
 
    # query = """
@@ -103,11 +103,11 @@ def obtener_datos_desde_hasta(conn, numero_serie, desde, hasta):
     WHERE "numero_serie" = %s
     AND "temporal_placa" BETWEEN %s AND %s
     ORDER BY "temporal_placa"
-    LIMIT 10000;
+    LIMIT 2000;
     """
     with conn.cursor() as cur:
         cur.execute(query, (numero_serie, desde, hasta))
-        rows = cur.fetchall()   # ✅ ACÁ
+        rows = cur.fetchall() 
 
     df = pd.DataFrame(
         rows,
@@ -303,7 +303,7 @@ def generar_ventanas(df, win_s):
     return df.groupby(pd.Grouper(freq=f"{win_s}s"))
 
 # Derivada de corriente
-def delta_corriente_por_ventana(grupos, fase="r"):
+def delta_corriente_por_ventana(grupos, fase):
     col = f"corriente_{fase}"
 
     df_agg = grupos[col].agg(
