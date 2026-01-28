@@ -19,8 +19,8 @@ conn = psycopg2.connect(
 numero_serie = "28562F60A8D8"
 #numero_serie = "28562F612CC4"
 
-desde = datetime(2026, 1, 9, 8, 0, tzinfo=pytz.UTC)
-hasta = datetime(2026, 1, 9, 15, 0, tzinfo=pytz.UTC)
+desde = datetime(2026, 1, 9, 19, 30, tzinfo=pytz.UTC)
+hasta = datetime(2026, 1, 9, 20, 30, tzinfo=pytz.UTC)
 
 q_corriente = """
 SELECT temporal_placa, corriente_r, corriente_s, corriente_t

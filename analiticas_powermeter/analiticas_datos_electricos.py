@@ -26,8 +26,21 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Constantes
-ID_PLEGADORA_ELECTRICO = 3
-ID_EVENTO_ELECTRICO = 1
+def obtener_id_analitica(conn, nombre_analitica):
+    query = """
+    SELECT id
+    FROM analiticas
+    WHERE nombre = %s
+      AND fecha_baja IS NULL
+    """
+    with conn.cursor() as cur:
+        cur.execute(query, (nombre_analitica,))
+        row = cur.fetchone()
+
+    if not row:
+        raise ValueError(f"No se encontró analítica: {nombre_analitica}")
+
+    return row[0]
 
 # Conexión a la base de datos.
 def connect_db():
@@ -55,35 +68,30 @@ def obtener_placas_habilitadas(conn, id_analitica):
         return cur.fetchall()
 
 # Obtener configuracon de la analitica de bobinas
-def obtener_configuracion_analitica(conn):
-    return (
-        300,    # tiempo_ejecucion:  minutos
-        60,     # win_s [s] -> intervalo de datos crudos que se toman para analizar
-        3,      # ventana_media_s    -> cantidad de muestras que se toman para establecer una media
-        3,      # tolerancia_rel [%] -> tolerancia esatblecida para definir un valor sobre la media de corriente
-        2,      # umbral_delta [A]  -> minima variacion de corriente para ser considerado un pico
-        120,    # tiempo_estable_s[s]   -> tiempo minimo durante el cual la corriente se encuentra sobre la media para declarar evento cerrado
-        3600    # duracion_max_evento: 1 hora
-    )    
+def obtener_configuracion_analitica(conn, numero_serie):
+    query = """
+    SELECT tiempo_ejecucion, win_s, ventana_media_s, tolerancia_rel, umbral_delta, tiempo_estable_s, duracion_max_evento
+    FROM configuracion_plegadora
+    WHERE numero_serie = %s
+    ORDER BY fecha_actualizacion DESC, id DESC
+    LIMIT 1;
+    """
+    with conn.cursor() as cur:
+        cur.execute(query, (numero_serie,))
+        row = cur.fetchone()
 
-   # query = """
-    #    SELECT win_s, ventana_media_s, tolerancia_rel, umbral_delta, tiempo_estable_s, duracion_max_evento
-    #   FROM configuracion_plegadora
-    #    ORDER BY ID DESC LIMIT 1;
-    #"""
-    #with conn.cursor(cursor_factory=DictCursor) as cur:
-    #    cur.execute(query)
-    #    resultado = cur.fetchone()
-    #    if resultado and all(resultado[campo] is not None for campo in resultado.keys()):
-    #            return resultado
-    #    return None
+    if not row:
+        raise RuntimeError(
+            f"No existe configuración activa para la plegadora {numero_serie}"
+        )
+    return row
 
 # obener cual fue la ultima fecha analizada 
 def obtener_ultimo_hasta_ejecutado(conn, numero_serie, id_analitica, desde, hasta):
     query = """
     SELECT MAX(hasta) 
     FROM observaciones_analiticas 
-    WHERE id_analitica = %s AND numero_serie = %s 
+    WHERE id_analitica = %s AND numero_serie = %s
     AND hasta BETWEEN %s AND %s;
     """
     with conn.cursor() as cur:
@@ -95,15 +103,15 @@ def obtener_ultimo_hasta_ejecutado(conn, numero_serie, id_analitica, desde, hast
 def obtener_datos_desde_hasta(conn, numero_serie, desde, hasta):
     query = """
     SELECT
-        "temporal_placa",
-        "corriente_r",
-        "corriente_s",
-        "corriente_t"
+        temporal_placa,
+        corriente_r,
+        corriente_s,
+        corriente_t
     FROM data_instantanea
-    WHERE "numero_serie" = %s
-    AND "temporal_placa" BETWEEN %s AND %s
-    ORDER BY "temporal_placa"
-    LIMIT 2000;
+    WHERE numero_serie = %s
+    AND temporal_placa BETWEEN %s AND %s
+    ORDER BY temporal_placa
+    LIMIT 1000;
     """
     with conn.cursor() as cur:
         cur.execute(query, (numero_serie, desde, hasta))
@@ -130,10 +138,10 @@ def obtener_datos_desde_hasta(conn, numero_serie, desde, hasta):
 def insertar_observacion_analitica(
     conn,
     id_analitica,
-    observacion,
     numero_serie,
     desde,
-    hasta
+    hasta,
+    observacion
 ):
     query = """
         INSERT INTO observaciones_analiticas (
@@ -144,10 +152,8 @@ def insertar_observacion_analitica(
             observacion,
             fecha
         )
-        VALUES (%s, %s, %s, %s, %s, %s);
+        VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP);
     """
-
-    fecha = datetime.now(pytz.UTC)
 
     with conn.cursor() as cur:
         cur.execute(
@@ -157,12 +163,12 @@ def insertar_observacion_analitica(
                 numero_serie,
                 desde,
                 hasta,
-                observacion,
-                fecha
+                observacion
             )
         )
 
-# Insertar analiticas de plegadora con sus pasos asociados
+
+# Insertar eventos de plegadora en analiticas_plegadoras
 def upsert_analiticas_plegadoras(
     conn,
     numero_serie,
@@ -171,15 +177,7 @@ def upsert_analiticas_plegadoras(
     duracion,
     valor
 ):
-    """
-    Inserta o actualiza un evento eléctrico de plegadora.
-
-    - Si existe un evento abierto (fin IS NULL), lo actualiza.
-    - Si no existe, inserta un nuevo evento.
-    """
-
     with conn.cursor() as cur:
-        # 1. Buscar evento abierto para la plegadora
         cur.execute("""
             SELECT id, inicio, valor
             FROM analiticas_plegadoras
@@ -192,16 +190,12 @@ def upsert_analiticas_plegadoras(
         row = cur.fetchone()
 
         if row:
-            # 2. Evento abierto → UPDATE
             id_evento, inicio_evento, valor_actual = row
 
-            # Recalcular duración total desde el inicio real
-            if fin is not None:
-                nueva_duracion = int((fin - inicio_evento).total_seconds())
-            else:
-                nueva_duracion = duracion
+            nueva_duracion = int(
+                (fin - inicio_evento).total_seconds()
+            ) if fin else duracion
 
-            # Mantener el pico máximo
             nuevo_valor = (
                 max(valor_actual, valor)
                 if valor_actual is not None and valor is not None
@@ -213,7 +207,8 @@ def upsert_analiticas_plegadoras(
                 SET
                     fin = %s,
                     duracion = %s,
-                    valor = %s
+                    valor = %s,
+                    temporal_server = CURRENT_TIMESTAMP
                 WHERE id = %s
             """, (
                 fin,
@@ -222,10 +217,7 @@ def upsert_analiticas_plegadoras(
                 id_evento
             ))
 
-            return id_evento
-
         else:
-            # 3. No hay evento abierto → INSERT
             cur.execute("""
                 INSERT INTO analiticas_plegadoras (
                     numero_serie,
@@ -244,7 +236,10 @@ def upsert_analiticas_plegadoras(
                 valor
             ))
 
-            return cur.fetchone()[0]
+            id_evento = cur.fetchone()[0]
+
+    return id_evento
+
 
 # Insertar alarmas de evento
 def insertar_alarma_evento(
@@ -421,7 +416,7 @@ def consolidar_eventos_maquina(
         df_ev = df.iloc[i_ini:i_fin].copy()
 
         if df_ev.empty:
-            # sin datos → cerramos conservadoramente
+            # sin datos → cerramos 
             eventos_maquina.append(actual)
             actual = {
                 "inicio": ev["inicio"],
@@ -526,7 +521,7 @@ def calcular_analiticas(
     tiempo_estable_s
 ):
     if df_m.empty:
-        return [], None
+        return [] 
 
     ventanas = generar_ventanas(df_m, win_s)
 
@@ -540,10 +535,7 @@ def calcular_analiticas(
 
     for fase, df_delta in deltas.items():
         registros = [
-            {
-                "t_inicio": row.temporal_placa,
-                "delta_corriente": row.delta_corriente
-            }
+            {"t_inicio": row.temporal_placa, "delta_corriente": row.delta_corriente}
             for row in df_delta.itertuples(index=False)
         ]
 
@@ -558,10 +550,10 @@ def calcular_analiticas(
         eventos_por_fase["T"]
     )
 
-    eventos_cerrados= consolidar_eventos_maquina(
+    eventos_cerrados = consolidar_eventos_maquina(
         eventos_fase=eventos_fase,
         df=df_m,
-        fase='r',
+        fase="r",
         ventana_media_s=ventana_media_s,
         tolerancia_rel=tolerancia_rel,
         tiempo_estable_s=tiempo_estable_s
@@ -573,6 +565,7 @@ def calcular_analiticas(
 if __name__ == "__main__":
 
     zona_horaria = pytz.timezone("UTC")
+    VENTANA_ANALISIS = timedelta(hours=1)
 
     while True:
         conn = connect_db()
@@ -580,56 +573,51 @@ if __name__ == "__main__":
             exit(1)
 
         try:
-            # 1) Obtener configuración de la analítica
-            configuracion = obtener_configuracion_analitica(conn)
-            if not configuracion:
-                logger.error(
-                    "No se encontraron parámetros de configuración. "
-                    "Esperando 30 minutos..."
-                )
-                time.sleep(1800)
-                continue
-
-            (
-                tiempo_ejecucion,
-                win_s,
-                ventana_media_s,
-                tolerancia_rel,
-                umbral_delta,
-                tiempo_estable_s,
-                duracion_max_evento
-            ) = configuracion
-
-            # 2) Placas con analítica habilitada
-            placas = obtener_placas_habilitadas(
-                conn,
-                ID_PLEGADORA_ELECTRICO
+            ID_PLEGADORA_ELECTRICO = obtener_id_analitica(
+                conn, "PLEGADORA_ELECTRICO"
             )
+            placas = obtener_placas_habilitadas(
+                conn, ID_PLEGADORA_ELECTRICO
+            )
+
+            tiempo_sleep = 60  # fallback
 
             for placa in placas:
                 numero_serie = placa["numero_serie"]
 
-                # 3) Ventana válida de ejecución
-                desde = placa["fecha_alta"]
-                hasta = (
-                    datetime.now(zona_horaria)
+                # ---------------- RANGO BASE ----------------
+                desde_base = placa["fecha_alta"]
+
+                ahora = datetime.now(zona_horaria)
+                hasta_teorico = (
+                    ahora
                     if placa["fecha_baja"] is None
-                    else min(placa["fecha_baja"], datetime.now(zona_horaria))
+                    else min(placa["fecha_baja"], ahora)
                 )
 
-                # 4) Avance incremental
+                # ---------------- CURSOR (UNA SOLA VEZ) ----------------
                 desde = obtener_ultimo_hasta_ejecutado(
                     conn,
                     numero_serie,
                     ID_PLEGADORA_ELECTRICO,
-                    desde,
-                    hasta
+                    desde_base,
+                    hasta_teorico
+                )
+
+                # Ventana fija de 1 hora
+                hasta = min(desde + VENTANA_ANALISIS, hasta_teorico)
+
+                logger.info(
+                    f"[RANGO] serie={numero_serie} desde={desde} hasta={hasta}"
                 )
 
                 if desde >= hasta:
+                    logger.info(
+                        f"[DEBUG] serie={numero_serie} sin rango para procesar"
+                    )
                     continue
 
-                # 5) Obtener datos eléctricos
+                # ---------------- DATOS ----------------
                 df = obtener_datos_desde_hasta(
                     conn,
                     numero_serie,
@@ -637,84 +625,103 @@ if __name__ == "__main__":
                     hasta
                 )
 
-                if df.empty:
-                    continue
-
-                # 6) Detectar eventos eléctricos
-                eventos_cerrados  = calcular_analiticas(
-                    df_m=df,
-                    win_s=win_s,
-                    ventana_media_s=ventana_media_s,
-                    tolerancia_rel=tolerancia_rel,
-                    umbral_delta=umbral_delta,
-                    tiempo_estable_s=tiempo_estable_s
+                logger.info(
+                    f"[DEBUG] serie={numero_serie} filas_df={len(df)}"
                 )
 
-                cantidad_eventos = 0
-                fecha_hasta = desde
+                if df.empty:
+                    insertar_observacion_analitica(
+                        conn,
+                        ID_PLEGADORA_ELECTRICO,
+                        numero_serie,
+                        desde,
+                        desde,
+                        "Sin datos en el rango"
+                    )
+                    continue
 
-                # 7.1) Persistir eventos cerrados
+                # ---------------- CONFIG ----------------
+                configuracion = obtener_configuracion_analitica(
+                    conn,
+                    numero_serie
+                )
+
+                (
+                    tiempo_ejecucion,
+                    win_s,
+                    ventana_media_s,
+                    tolerancia_rel,
+                    umbral_delta,
+                    tiempo_estable_s,
+                    duracion_max_evento
+                ) = configuracion
+
+                tiempo_sleep = int(float(tiempo_ejecucion))
+
+                # ---------------- ANALITICA ----------------
+                eventos_cerrados = calcular_analiticas(
+                    df,
+                    win_s,
+                    ventana_media_s,
+                    tolerancia_rel,
+                    umbral_delta,
+                    tiempo_estable_s
+                )
+
+                logger.info(
+                    f"[DEBUG] serie={numero_serie} eventos_detectados={len(eventos_cerrados)}"
+                )
+
+                # ---------------- CURSOR REAL ----------------
+                fecha_hasta = df["temporal_placa"].max()
+                cantidad_eventos = 0
+
                 for ev in eventos_cerrados:
                     inicio = ev["inicio"]
                     fin = ev["fin"]
 
                     duracion = int((fin - inicio).total_seconds())
+
                     if duracion <= 0 or duracion > duracion_max_evento:
                         continue
 
                     valor = ev.get("valor") or len(ev["fases"])
 
                     upsert_analiticas_plegadoras(
-                        conn=conn,
-                        numero_serie=numero_serie,
-                        inicio=inicio,
-                        fin=fin,
-                        duracion=duracion,
-                        valor=None
+                        conn,
+                        numero_serie,
+                        inicio,
+                        fin,
+                        duracion,
+                        valor
                     )
 
                     cantidad_eventos += 1
                     fecha_hasta = max(fecha_hasta, fin)
 
-                # 7.2) Persistir evento abierto (si existe)
-                #if evento_abierto:
-                #    inicio = evento_abierto["inicio"]
-                #    fin = None
-                #    duracion = int((hasta - inicio).total_seconds())
-                #    valor = evento_abierto.get("valor") or len(evento_abierto["fases"])
-
-                #    if duracion > 0 and duracion <= duracion_max_evento:
-                    #    upsert_analiticas_plegadoras(
-                        #    conn=conn,
-                        #    numero_serie=numero_serie,
-                        #    inicio=inicio,
-                        #    fin=fin,
-                        #    duracion=duracion,
-                        #   valor=valor
-                        #)
-
-                # 8) Registrar observación de ejecución
+                # ---------------- OBSERVACION ----------------
                 insertar_observacion_analitica(
                     conn,
-                    id_analitica=ID_PLEGADORA_ELECTRICO,
-                    observacion=f"Eventos eléctricos detectados: {cantidad_eventos}",
-                    numero_serie=numero_serie,
-                    desde=desde,
-                    hasta=fecha_hasta
+                    ID_PLEGADORA_ELECTRICO,
+                    numero_serie,
+                    desde,
+                    fecha_hasta,
+                    f"Eventos eléctricos detectados: {cantidad_eventos}"
                 )
 
-            # 9) Commit único
             conn.commit()
 
             logger.info(
-                f"Esperando {tiempo_ejecucion} segundos antes de la próxima ejecución..."
+                f"Esperando {tiempo_sleep} segundos antes de la próxima ejecución..."
             )
-            time.sleep(int(float(tiempo_ejecucion)))
+            time.sleep(tiempo_sleep)
 
         except Exception as e:
             conn.rollback()
             logger.error(f"Error en el proceso: {e}")
-            logger.info("Esperando 30 minutos antes de la próxima ejecución...")
+            logger.info(
+                "Esperando 30 minutos antes de la próxima ejecución..."
+            )
             time.sleep(1800)
 
         finally:
