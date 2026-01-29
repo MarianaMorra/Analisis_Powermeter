@@ -103,15 +103,14 @@ def obtener_ultimo_hasta_ejecutado(conn, numero_serie, id_analitica, desde, hast
 def obtener_datos_desde_hasta(conn, numero_serie, desde, hasta):
     query = """
     SELECT
-        temporal_placa,
-        corriente_r,
-        corriente_s,
-        corriente_t
+        "temporal_placa",
+        "corriente_r",
+        "corriente_s",
+        "corriente_t"
     FROM data_instantanea
     WHERE numero_serie = %s
     AND temporal_placa BETWEEN %s AND %s
     ORDER BY temporal_placa
-    LIMIT 1000;
     """
     with conn.cursor() as cur:
         cur.execute(query, (numero_serie, desde, hasta))
@@ -179,67 +178,22 @@ def upsert_analiticas_plegadoras(
 ):
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT id, inicio, valor
-            FROM analiticas_plegadoras
-            WHERE numero_serie = %s
-              AND fin IS NULL
-            ORDER BY inicio DESC
-            LIMIT 1
-        """, (numero_serie,))
-
-        row = cur.fetchone()
-
-        if row:
-            id_evento, inicio_evento, valor_actual = row
-
-            nueva_duracion = int(
-                (fin - inicio_evento).total_seconds()
-            ) if fin else duracion
-
-            nuevo_valor = (
-                max(valor_actual, valor)
-                if valor_actual is not None and valor is not None
-                else valor or valor_actual
-            )
-
-            cur.execute("""
-                UPDATE analiticas_plegadoras
-                SET
-                    fin = %s,
-                    duracion = %s,
-                    valor = %s,
-                    temporal_server = CURRENT_TIMESTAMP
-                WHERE id = %s
-            """, (
-                fin,
-                nueva_duracion,
-                nuevo_valor,
-                id_evento
-            ))
-
-        else:
-            cur.execute("""
-                INSERT INTO analiticas_plegadoras (
-                    numero_serie,
-                    inicio,
-                    fin,
-                    duracion,
-                    valor
-                )
-                VALUES (%s, %s, %s, %s, %s)
-                RETURNING id;
-            """, (
+            INSERT INTO analiticas_plegadoras (
                 numero_serie,
                 inicio,
                 fin,
                 duracion,
-                valor
-            ))
-
-            id_evento = cur.fetchone()[0]
-
-    return id_evento
-
+                valor,
+                temporal_server
+            )
+            VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+        """, (
+            numero_serie,
+            inicio,
+            fin,
+            duracion,
+            valor
+        ))
 
 # Insertar alarmas de evento
 def insertar_alarma_evento(
@@ -306,7 +260,12 @@ def delta_corriente_por_ventana(grupos, fase):
         i_min="min"
     ).reset_index()
 
-    df_agg["delta_corriente"] = df_agg["i_max"] - df_agg["i_min"]
+  # para matar picos negativos
+    baseline = df_agg["i_min"].rolling(
+        window=3, min_periods=1
+    ).median()
+
+    df_agg["delta_corriente"] = df_agg["i_max"] - baseline
 
     return df_agg
 
@@ -416,7 +375,7 @@ def consolidar_eventos_maquina(
         df_ev = df.iloc[i_ini:i_fin].copy()
 
         if df_ev.empty:
-            # sin datos → cerramos 
+            # sin datos → cerramos conservadoramente
             eventos_maquina.append(actual)
             actual = {
                 "inicio": ev["inicio"],
@@ -521,8 +480,18 @@ def calcular_analiticas(
     tiempo_estable_s
 ):
     if df_m.empty:
-        return [] 
+        return []
+      
+    df_m = recortar_rango_operativo_por_corriente(
+            df_m,
+            fase="r",               # o la fase que prefieras como referencia
+            umbral_corriente=umbral_delta,  # coherente con tu detección
+            min_muestras=2          # para picos, 2 suele andar mejor que 3
+        )
 
+    if df_m.empty:
+        return []
+        
     ventanas = generar_ventanas(df_m, win_s)
 
     deltas = {
@@ -535,7 +504,10 @@ def calcular_analiticas(
 
     for fase, df_delta in deltas.items():
         registros = [
-            {"t_inicio": row.temporal_placa, "delta_corriente": row.delta_corriente}
+            {
+                "t_inicio": row.temporal_placa,
+                "delta_corriente": row.delta_corriente
+            }
             for row in df_delta.itertuples(index=False)
         ]
 
@@ -550,10 +522,10 @@ def calcular_analiticas(
         eventos_por_fase["T"]
     )
 
-    eventos_cerrados = consolidar_eventos_maquina(
+    eventos_cerrados= consolidar_eventos_maquina(
         eventos_fase=eventos_fase,
         df=df_m,
-        fase="r",
+        fase='r',
         ventana_media_s=ventana_media_s,
         tolerancia_rel=tolerancia_rel,
         tiempo_estable_s=tiempo_estable_s
@@ -681,7 +653,6 @@ if __name__ == "__main__":
                     fin = ev["fin"]
 
                     duracion = int((fin - inicio).total_seconds())
-
                     if duracion <= 0 or duracion > duracion_max_evento:
                         continue
 
