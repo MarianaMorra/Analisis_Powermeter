@@ -1,13 +1,13 @@
 import pandas as pd
-from datetime import timedelta
+from datetime import timedelta, date, datetime
 import psycopg2
 import os
 import logging
 from psycopg2.extras import DictCursor
-from datetime import datetime, timedelta
 import time
 import pytz
 import sys
+import numpy as np
 
 # Cargar las variables de entorno
 DB_HOST = os.environ.get("DB_HOST", "localhost")
@@ -25,9 +25,7 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-# Constantes
-I_MIN_ACTIVA = 5.0  # A
-
+#---- FUNCIONES GENERALES ------------------------------------------------------------------------------------------------
 def obtener_id_analitica(conn, nombre_analitica):
     query = """
     SELECT id
@@ -190,6 +188,7 @@ def insertar_observacion_analitica(
             )
         )
 
+#---- FUNCIONES PARA DETECCION DE EVENTOS ---------------------------------------------------------------------------------
 # Insertar eventos de plegadora en analiticas_plegadoras
 def insertar_evento_analiticas_plegadoras(
     conn,
@@ -218,72 +217,6 @@ def insertar_evento_analiticas_plegadoras(
             valor
         ))
 
-# Insertar alarmas de evento
-def insertar_alarma_evento(
-    conn,
-    causa,
-    fecha_inicio,
-    fecha_fin,
-    nivel_nombre,
-    estado_nombre,
-    lista_nombre,
-    numero_serie
-):
-    query = """
-        INSERT INTO alarmas (
-            id_activo,
-            id_nivel_alarma,
-            id_estado_alarma,
-            id_lista_alarma,
-            causa,
-            fecha_inicio,
-            fecha_fin
-        )
-        SELECT
-            va.id_activo,
-            na.id,
-            ea.id,
-            la.id,
-            %s,
-            %s,
-            %s
-        FROM vista_activo_por_serie_y_fecha va
-        JOIN niveles_alarmas na ON na.nombre = %s
-        JOIN estados_alarmas ea ON ea.nombre = %s
-        JOIN listas_alarmas la ON la.nombre = %s
-        WHERE va.numero_serie = %s
-          AND va.fecha_alta <= %s
-          AND (va.fecha_baja IS NULL OR %s <= va.fecha_baja)
-    """
-
-    with conn.cursor() as cur:
-        cur.execute(query, (
-            causa,
-            fecha_inicio,
-            fecha_fin,
-            nivel_nombre,
-            estado_nombre,
-            lista_nombre,
-            numero_serie,
-            fecha_inicio,
-            fecha_inicio
-        ))
-
-# Cierre de alarma por falta de datos       
-def cerrar_alarma_falta_datos(conn, id_activo, fecha_fin):
-    query = """
-        UPDATE alarmas
-        SET fecha_fin = %s
-        WHERE id_activo = %s
-          AND fecha_fin IS NULL
-          AND id_lista_alarma = (
-              SELECT id FROM listas_alarmas
-              WHERE nombre = 'falta_datos'
-          );
-    """
-    with conn.cursor() as cur:
-        cur.execute(query, (fecha_fin, id_activo))
-  
 # Generacion de ventanas de datos
 def generar_ventanas(df, win_s):
     df = df.sort_values("temporal_placa").set_index("temporal_placa")
@@ -468,7 +401,6 @@ def consolidar_eventos_maquina(
 
     return eventos_maquina
 
-
 # Evitar que picos de arranque/ fin contaminen los verdaderos eventos de las plegadoras
 def recortar_rango_operativo_por_corriente(
     df,
@@ -507,132 +439,21 @@ def recortar_rango_operativo_por_corriente(
 
     return df.iloc[idx_ini:idx_fin + 1].copy()
 
-# Obtencion de datos para alarmas
-def obtener_configuracion_alarmas():
-    query = """
-    SELECT desequilibrio_warning, desequilibrio_critico, sobrecorriente_warning, sobrecorriente_critico, tiempo_picos_warning, tiempo_picos_critico, tiempo_sin_datos
-    FROM configuracion_alarma
-    ORDER BY fecha_actualizacion DESC LIMIT 1;
-    """
-    with conn.cursor(cursor_factory=DictCursor) as cur:
-        cur.execute(query)
-        resultado = cur.fetchone()
-        if resultado and all(resultado[campo] is not None for campo in resultado.keys()):
-                return resultado
-        return None
-
-# Obtener media historica de corriente
-def obtener_media_historica(id_activo, fase):
-    query = """
-        SELECT media_p90
-        FROM historico_media
-        WHERE id_activo = %s AND fase = %s
-        ORDER BY fecha_carga DESC LIMIT 1;
-        """
-    with conn.cursor(cursor_factory=DictCursor) as cur:
-        cur.execute(query,(id_activo, fase))
-        resultado = cur.fetchone()
-        if resultado and all(resultado[campo] is not None for campo in resultado.keys()):
-                return resultado
-        return None    
-
-# Insertar fila en tabla auxiliar acumulado_corriente
-def insertar_acumulado_corriente(id_activo, fase, ts_inicio, ts_fin, media_corriente):
-    query = """
-        INSERT INTO acumulado_corriente
-            (id_activo, fase, ts_inicio, ts_fin, i_media)
-        VALUES
-            (%s, %s, %s, %s, %s);
-    """
-
-    with conn.cursor() as cur:
-        cur.execute(
-            query,
-            (id_activo, fase, ts_inicio, ts_fin, media_corriente)
-        )
-    return True
-
-# Calcula y devuelve la media de corriente por fase cada 5 minutos. Carga el valor en la tabla correspondiente
-def procesar_data_cinco_minutos(
-    df,
-    id_activo,
-    I_MIN_ACTIVA
-):
-    df = df.sort_values("temporal_placa")
-
-    df["ventana_5m"] = df["temporal_placa"].dt.floor("5min")
-
-    for ventana, grupo in df.groupby("ventana_5m"):
-        ts_inicio = ventana
-        ts_fin = ventana + timedelta(minutes=5)
-
-        for fase_col, fase_nombre in [
-            ("corriente_r", "R"),
-            ("corriente_s", "S"),
-            ("corriente_t", "T"),
-        ]:
-            media = grupo[fase_col].mean()
-
-            if media < I_MIN_ACTIVA:
-                continue
-
-            insertar_acumulado_corriente(
-                id_activo,
-                fase_nombre,
-                ts_inicio,
-                ts_fin,
-                media,
-            )
-
-# Alarma por desequilibrio de fases
-def alarma_desequilibrio_fases():
-    return 
-
-# Alarma por sobrecorriente: trifasica/monofasica
-def alarma_sobrecorriente():
-    return
-
-# Alarma por picos altos repetitivos
-def alarma_picos_repetitivos():
-    return
-
 # Calcular los eventos de las plegadoras a partir de la observacion de la corriente
 def calcular_analiticas(
     df_m,
-    desde,
-    hasta,
     win_s,
     ventana_media_s,
     tolerancia_rel,
     umbral_delta,
     tiempo_estable_s
 ):
-    if df_m.empty:
-        # 1) Si no hay datos, inserto observacion y disparo alarma
-        insertar_observacion_analitica(conn, ID_PLEGADORA_ELECTRICO, numero_serie, desde, hasta, "Ausencia de datos nuevos")
-        insertar_alarma_evento(
-            conn = conn,
-            causa ="Ausencia de datos nuevos",
-            latitud = None,
-            longitud = None,
-            fecha_inicio = desde,
-            fecha_fin = None,
-            nivel_nombre="advertencia",
-            estado_nombre="inactiva",
-            lista_nombre="traslacion_medio",
-            numero_serie=numero_serie,
-        )
-        return []
     
-    # 2) Cierro alarma por falta de datos. Cargo la fecha de finalizacion como el timestamp del primer dato valido
-    cerrar_alarma_falta_datos(
-        conn,
-        id_activo,
-        fecha_fin=df_m["temporal_placa"].min()
-    )
 
-    # 3) Procesamos los datos raw cada 5 minutos para obtener las ventanas que generan la media historica
-    #procesar_data_cinco_minutos(df_m, id_activo, I_MIN_ACTIVA)
+    if df_m.empty:
+        # 1) Si no hay datos, inserto observacion 
+        insertar_observacion_analitica(conn, ID_PLEGADORA_ELECTRICO, numero_serie, desde, hasta, "Ausencia de datos nuevos")
+        return []
 
     # 4) Ajustamos los datos para no detectar picos de encendido/apagado  
     df_m = recortar_rango_operativo_por_corriente(
@@ -689,13 +510,6 @@ def calcular_analiticas(
         tiempo_estable_s=tiempo_estable_s
     )
 
-    # Vamos a verificar si se debe disparar una alarma
-    # 10) Alarmas por desbalance de fases:
-    
-    # 11) Alarmas por sobrecorriente:
-    
-    # 12) Alarmas por picos repetidos:
-
     return eventos_cerrados
 
 # Funcion principal
@@ -723,29 +537,22 @@ if __name__ == "__main__":
             tiempo_sleep = 60  # fallback
 
             for placa in placas:
+                # Miro en un for de placas, de q fecha a q fecha tinene habilitdada
                 numero_serie = placa["numero_serie"]
-
-                # ------------------------------------------------
-                desde_base = placa["fecha_alta"]
-
-                ahora = datetime.now(zona_horaria)
-                hasta_teorico = (
-                    ahora
+                desde = placa["fecha_alta"]
+                hasta = (
+                    datetime.now(zona_horaria)
                     if placa["fecha_baja"] is None
-                    else min(placa["fecha_baja"], ahora)
+                    else min(placa["fecha_baja"], datetime.now(zona_horaria))
                 )
-                # ------------------------------------------------
+               
+               # Obtener el último "hasta" ejecutado en el rango
                 desde = obtener_ultimo_hasta_ejecutado(
-                    conn,
-                    numero_serie,
-                    ID_PLEGADORA_ELECTRICO,
-                    desde_base,
-                    hasta_teorico
+                    conn, numero_serie, ID_PLEGADORA_ELECTRICO, desde, hasta
                 )
-
                 # Ventana fija de 1 hora
-                hasta = min(desde + VENTANA_ANALISIS, hasta_teorico)
-
+                # hasta = min(desde + VENTANA_ANALISIS, hasta)
+                
                 if desde >= hasta:
                     continue
                 
@@ -756,12 +563,6 @@ if __name__ == "__main__":
                     desde,
                     hasta
                 )
-                
-                # Obtenemos id_activo mediante numero_serie
-                id_activo = obtener_id_activo_por_numero_serie(conn, numero_serie)
-
-                if id_activo is None:
-                    continue
 
                 # Obtenemos la configuracion necesaria para calcular las analitas (por maquina)
                 configuracion = obtener_configuracion_analitica(conn, numero_serie)
@@ -778,8 +579,7 @@ if __name__ == "__main__":
                 tiempo_sleep = int(float(tiempo_ejecucion))
 
                 # Calculo de analiticas: eventos de corriente
-                # NOTA: LE ESTOY CARGANDO DESDE Y HASTA PARA PROCESAR ALARMAS. ESTO NO PASABA EN ANALITICAS_BOBINAS
-                eventos_cerrados = calcular_analiticas(df, desde, hasta, win_s, ventana_media_s, tolerancia_rel, umbral_delta, tiempo_estable_s)
+                eventos_cerrados = calcular_analiticas(df, win_s, ventana_media_s, tolerancia_rel, umbral_delta, tiempo_estable_s)
 
                 fecha_hasta = df["temporal_placa"].max()
                 cantidad_eventos = 0
@@ -794,11 +594,6 @@ if __name__ == "__main__":
                         continue
 
                     duracion = int((fin - inicio).total_seconds())
-                    
-                    logger.info(
-                        f"EVENTO DURACION: {duracion}s (max={duracion_max_evento}s)"
-                    )
-
                     if duracion <= 0 or duracion > duracion_max_evento:
                         continue
 

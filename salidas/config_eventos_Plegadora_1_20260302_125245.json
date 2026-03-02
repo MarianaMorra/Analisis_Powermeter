@@ -1,0 +1,10 @@
+{
+  "win_s": 60,
+  "ventana_media_s": 30,
+  "tolerancia_rel": 0.05,
+  "umbral_delta": 10.0,
+  "tiempo_estable_s": 20,
+  "fase_recorte": "r",
+  "umbral_corriente_recorte": 2.5,
+  "min_muestras_recorte": 2
+}
