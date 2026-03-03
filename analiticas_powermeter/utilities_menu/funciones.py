@@ -16,14 +16,14 @@ from ..libreria_eventos import consolidar_eventos_maquina
 from ..libreria_eventos import recortar_rango_operativo_por_corriente
 
 # --------------------- VARIABLES CONFIGURABLES -----------------------
-
 CONFIG= {
     "win_s": 60,
+    "baseline_win": 2,
     "ventana_media_s": 30,
     "tolerancia_rel": 0.05,
-    "umbral_delta": 10.0,
+    "umbral_delta": 2.0,
     "tiempo_estable_s": 20,
-    "fase_recorte": "r",
+    "fase_recorte": "media",
     "umbral_corriente_recorte": 2.0,
     "min_muestras_recorte": 2,
 }
@@ -59,7 +59,6 @@ def exportar_config(nombre_maquina: str):
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # por prolijidad mínima
     maq = nombre_maquina.replace(" ", "_")
 
     out_path = os.path.join("salidas", f"config_eventos_{maq}_{ts}.json")
@@ -98,16 +97,16 @@ def set_config(clave: str, valor: str):
     # strings u otros
     CONFIG[clave] = valor
 
-
 def modificar_parametros_eventos_menu():
     # definición de tipos y validaciones mínimas
     campos = [
         ("win_s", int, "Tamaño de ventana (segundos)", 1, 24*3600),
+        ("baseline_win", int, "Cantidad de ventanas", 1, 24*3600),
         ("ventana_media_s", int, "Ventana media (muestras)", 1, 10**9),
         ("tolerancia_rel", float, "Tolerancia relativa (ej 0.05)", 0.0, 1.0),
         ("umbral_delta", float, "Umbral delta corriente", 0.0, None),
-        ("tiempo_estable_s", int, "Tiempo estable para cierre (seg)", 0, 24*3600),
-        ("fase_recorte", str, "Fase recorte (r/s/t)", None, None),
+        ("tiempo_estable_s", int, "Tiempo estable para cierre (segundos)", 0, 24*3600),
+        ("fase_recorte", str, "Fase recorte (r/s/t/media)", None, None),
         ("umbral_corriente_recorte", float, "Umbral corriente recorte", 0.0, None),
         ("min_muestras_recorte", int, "Mínimo muestras recorte", 1, 10**9),
     ]
@@ -151,7 +150,7 @@ def modificar_parametros_eventos_menu():
 
             else:  # str
                 val = nuevo.strip().lower()
-                if clave == "fase_recorte" and val not in ("r", "s", "t"):
+                if clave == "fase_recorte" and val not in ("r", "s", "t", "media"):
                     raise ValueError("fase_recorte debe ser r, s o t")
 
             CONFIG[clave] = val
@@ -209,8 +208,6 @@ def cargar_csv_instantanea(path_csv: str) -> tuple[pd.DataFrame, str, str]:
     return df_i, serie, nombre
 
 # --------------------- DETECCION EVENTOS -----------------------------
-import pandas as pd
-
 # Helpers
 def deltas_a_dicts(df_delta: pd.DataFrame):
     """
@@ -231,14 +228,14 @@ def deltas_a_dicts(df_delta: pd.DataFrame):
 def calcular_eventos_desde_df(
     df_m,
     win_s,
+    baseline_win,
     ventana_media_s,
     tolerancia_rel,
     umbral_delta,
     tiempo_estable_s,
     umbral_corriente_recorte,
     min_muestras_recorte,
-    *,
-    fase_recorte="r",
+    fase_recorte
 ):
     """
     Requiere df_m con:
@@ -272,9 +269,9 @@ def calcular_eventos_desde_df(
 
     # 3) Deltas por fase
     deltas = {
-        "R": delta_corriente_por_ventana(ventanas, fase="r"),
-        "S": delta_corriente_por_ventana(ventanas, fase="s"),
-        "T": delta_corriente_por_ventana(ventanas, fase="t"),
+        "R": delta_corriente_por_ventana(ventanas, baseline_win, fase="r"),
+        "S": delta_corriente_por_ventana(ventanas, baseline_win, fase="s"),
+        "T": delta_corriente_por_ventana(ventanas, baseline_win, fase="t"),
     }
 
     # 4) Eventos simples por fase
@@ -309,14 +306,16 @@ def calcular_eventos_desde_df(
     return eventos_maquina
 
 # --------------------- GRAFICA CORRIENTE - EVENTOS -------------------
-def graficar_maquina(df_i: pd.DataFrame,
-                             serie: str,
-                             nombre: str,
-                             df_ev: pd.DataFrame | None = None,
-                             out_dir: str = "salidas"):
-
+def graficar_maquina(
+    df_i: pd.DataFrame,
+    serie: str,
+    nombre: str,
+    df_ev: pd.DataFrame | list | None = None,
+    out_dir: str = "salidas"
+):
     os.makedirs(out_dir, exist_ok=True)
 
+    # --- Validación df_i ---
     if "temporal_placa" not in df_i.columns:
         raise ValueError("df_i debe tener columna temporal_placa")
 
@@ -329,6 +328,7 @@ def graficar_maquina(df_i: pd.DataFrame,
 
     fig = go.Figure()
 
+    # --- Corrientes ---
     for fase in ("r", "s", "t"):
         col = f"corriente_{fase}"
         if col not in df.columns:
@@ -343,21 +343,31 @@ def graficar_maquina(df_i: pd.DataFrame,
             )
         )
 
-    # Eventos como bandas verticales
-    if df_ev is not None and not df_ev.empty:
-        eventos = df_ev.copy()
-        eventos["inicio"] = pd.to_datetime(eventos["inicio"], utc=True, errors="coerce")
-        eventos["fin"] = pd.to_datetime(eventos["fin"], utc=True, errors="coerce")
-        eventos = eventos.dropna(subset=["inicio", "fin"])
+    # --- Eventos como bandas verticales ---
+    if df_ev is not None:
+        # aceptar lista o df
+        if isinstance(df_ev, list):
+            eventos = pd.DataFrame(df_ev)
+        else:
+            eventos = df_ev.copy()
 
-        for _, ev in eventos.iterrows():
-            fig.add_vrect(
-                x0=ev["inicio"],
-                x1=ev["fin"],
-                fillcolor="red",
-                opacity=0.2,
-                line_width=0
-            )
+        # si no hay nada, no dibujar bandas
+        if not eventos.empty:
+            if not {"inicio", "fin"}.issubset(eventos.columns):
+                raise ValueError("df_ev debe tener columnas 'inicio' y 'fin'")
+
+            eventos["inicio"] = pd.to_datetime(eventos["inicio"], utc=True, errors="coerce")
+            eventos["fin"] = pd.to_datetime(eventos["fin"], utc=True, errors="coerce")
+            eventos = eventos.dropna(subset=["inicio", "fin"])
+
+            for _, ev in eventos.iterrows():
+                fig.add_vrect(
+                    x0=ev["inicio"],
+                    x1=ev["fin"],
+                    fillcolor="red",
+                    opacity=0.2,
+                    line_width=0
+                )
 
     fig.update_layout(
         title=f"{nombre} ({serie}) - Corrientes R/S/T",
@@ -367,7 +377,28 @@ def graficar_maquina(df_i: pd.DataFrame,
     )
 
     out_path = os.path.join(out_dir, f"{serie}_corrientes.html")
-
     fig.write_html(out_path, auto_open=True)
-
     return out_path
+
+
+def eliminar_eventos_solapados(eventos):
+
+    if not eventos:
+        return []
+
+    eventos_ordenados = sorted(eventos, key=lambda e: e["inicio"])
+
+    resultado = []
+    actual = eventos_ordenados[0].copy()
+
+    for ev in eventos_ordenados[1:]:
+
+        if ev["inicio"] <= actual["fin"]:  # hay solape
+            if ev["fin"] > actual["fin"]:
+                actual["fin"] = ev["fin"]
+        else:
+            resultado.append(actual)
+            actual = ev.copy()
+
+    resultado.append(actual)
+    return resultado

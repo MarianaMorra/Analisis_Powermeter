@@ -7,7 +7,7 @@ from .utilities_menu.funciones import cargar_csv_instantanea
 from .utilities_menu.funciones import graficar_maquina
 from .utilities_menu.funciones import exportar_config
 from .utilities_menu.funciones import cargar_ultimo_config_maquina
-from .utilities_menu.funciones import seleccionar_plegadora
+from .utilities_menu.funciones import eliminar_eventos_solapados
 
 def mostrar_menu():
     print("\n--- Menú de opciones ---")
@@ -16,9 +16,9 @@ def mostrar_menu():
     print("3. Graficar")
     print("4. Exportar cambios")
     print("0. Salir")
+    print("-------------------------")
 
 def main():
-    df_total = None          # DF con todas las máquinas (como viene del CSV)
     df_i = None              # DF filtrado a la máquina elegida
     df_ev = None             # DF eventos de la máquina elegida (inicio/fin)
     serie = None
@@ -28,6 +28,7 @@ def main():
         mostrar_menu()
         opcion = input("Seleccione una opción: ").strip()
 
+        # --- INGRESO DE DATOS ---------------------------------------------------------
         if opcion == "1":
             try:
                 path_csv = input("Ingrese el nombre o path del archivo CSV: ").strip()
@@ -54,9 +55,10 @@ def main():
             except Exception as e:
                 print(f"Error cargando CSV: {e}")
 
+        # --- MODIFICACION PARAMETROS -----------------------------------------------
         elif opcion == "2":
             if df_i is None or df_i.empty:
-                print("Primero cargá el CSV y elegí la máquina (opción 1).")
+                print("Primero cargue el CSV y seleccione la máquina (opción 1).")
                 continue
     
             try:
@@ -64,24 +66,28 @@ def main():
             except Exception as e:
                 print(f"Error modificando parámetros: {e}")
 
+        # --- GRAFICA CORRIENTES ----------------------------------------------------
         elif opcion == "3":
             if df_i is None or df_i.empty:
-                print("Primero cargá el CSV y elegí la máquina (opción 1).")
+                print("Primero cargue el CSV y seleccione la máquina (opción 1).")
                 continue
 
             try:
                 eventos = calcular_eventos_desde_df(df_i, **CONFIG)
 
-                df_ev = pd.DataFrame([
+                # filtrar eventos válidos
+                eventos = [
                     {"inicio": e["inicio"], "fin": e["fin"]}
                     for e in eventos
-                    if e.get("fin") is not None
-                ])
+                    if e.get("inicio") is not None and e.get("fin") is not None
+                ]
 
-                print(f"Eventos calculados: {len(df_ev)}")
+                # eliminar solapados
+                eventos_maquina = eliminar_eventos_solapados(eventos)
 
-                # Si querés graficar acá mismo (como lo tenés hoy):
-                graficar_maquina(df_i=df_i, serie=serie, nombre=nombre, df_ev=df_ev, out_dir="salidas")
+                print(f"Eventos calculados: {len(eventos_maquina)}")
+
+                graficar_maquina(df_i, serie, nombre, eventos_maquina, "salidas")
 
             except Exception as e:
                 print(f"Error calculando eventos o graficando: {e}")

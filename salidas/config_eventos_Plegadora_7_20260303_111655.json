@@ -1,0 +1,11 @@
+{
+  "win_s": 5,
+  "baseline_win": 2,
+  "ventana_media_s": 5,
+  "tolerancia_rel": 0.13,
+  "umbral_delta": 2.5,
+  "tiempo_estable_s": 5,
+  "fase_recorte": "media",
+  "umbral_corriente_recorte": 0.8,
+  "min_muestras_recorte": 2
+}
